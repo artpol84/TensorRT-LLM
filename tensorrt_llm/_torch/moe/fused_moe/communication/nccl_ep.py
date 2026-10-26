@@ -392,7 +392,9 @@ class NcclEP(Communication):
                 else None
             ),
             recv_slots_global,
-            ctx.recv_topk_weights_buf.view(self.max_recv_tokens, self.max_top_k),
+            ctx.recv_topk_weights_buf.view(self.max_recv_tokens, self.max_top_k).to(
+                token_final_scales.dtype
+            ),
         )
 
     # ------------------------------------------------------------------

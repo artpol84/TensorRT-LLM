@@ -460,11 +460,17 @@ class CommunicationFactory:
             )
             if nccl_ep_unavailable_reason is not None:
                 raise ValueError(nccl_ep_unavailable_reason)
+            import os as _os
+
+            # NCCLEP_MAX_TOKENS overrides NCCL EP's per-rank max tokens. The receive buffer, and the row count
+            # the MoE runner processes, is ep_size * this value, so a smaller value avoids padded rows when the
+            # batch is known and fixed.
+            _ncclep_max_tokens = int(_os.environ.get("NCCLEP_MAX_TOKENS") or 0) or max_num_tokens
             return NcclEP(
                 mapping,
                 num_slots,
                 hidden_size,
-                max_num_tokens,
+                _ncclep_max_tokens,
                 moe_max_num_tokens,
                 top_k=top_k,
                 quant_config=quant_config,

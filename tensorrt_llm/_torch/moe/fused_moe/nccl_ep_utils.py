@@ -21,6 +21,8 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
+import os
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -218,12 +220,23 @@ class NcclEpContext:
         # even when dispatch used a narrower quantized representation.
         max_token_bytes = max(dispatch_token_bytes, hidden_size * 2)
 
+        # NCCLEP_ZEROCOPY: "1" = persistent window-backed dispatch outputs, group zero_copy=AUTO (opportunistic
+        # STORE/TMA zero-copy); "cft" = the same windows with the group's zero_copy=ON, which CFT zero-copy needs
+        # (combine is unaffected: the LL combine does not require windows).
+        zerocopy_setting = os.environ.get("NCCLEP_ZEROCOPY", "0").lower()
+        zerocopy_group_on = zerocopy_setting == "cft"
+        group_kwargs = {}
+        if zerocopy_group_on:
+            from nccl.ep import ZeroCopyMode
+
+            group_kwargs["zero_copy"] = ZeroCopyMode.ON
         cfg = GroupConfig(
             algorithm=Algorithm.LOW_LATENCY,
             num_experts=num_experts,
             max_dispatch_tokens_per_rank=max_tokens_per_rank,
             max_recv_tokens_per_rank=self.max_recv_tokens,
             max_token_bytes=max_token_bytes,
+            **group_kwargs,
         )
         self.ep_group = Group.create(self.comm, cfg)
 
@@ -309,17 +322,59 @@ class NcclEpContext:
                 device=device,
             )
 
+        # Persistent zero-copy outputs (NCCLEP_ZEROCOPY=1): the dispatch token and scales outputs live in
+        # registered NCCL windows acquired once here (eagerly, outside CUDA graph capture) and kept for the
+        # lifetime of the context, so peers' LL dispatch writes land directly in the buffers the MoE runner
+        # reads, with stable addresses for CUDA graphs. The group stays zero_copy=AUTO (opportunistic): ON would
+        # also require window-backed combine inputs.
+        self.persistent_zerocopy = zerocopy_setting in ("1", "cft")
+        output_tokens_window = None
+        scales_window = None
+        if self.persistent_zerocopy:
+            from tensorrt_llm.bindings.internal.thop import BufferKind
+
+            def _acquire_window(buf, what):
+                win_buf, kind, handle = torch.ops.trtllm.allocate_output_with_nccl_window(
+                    buf, int(BufferKind.NCCL_WINDOW), mapping.moe_ep_group
+                )
+                if kind != int(BufferKind.NCCL_WINDOW) or not handle:
+                    raise RuntimeError(
+                        f"NCCLEP_ZEROCOPY=1: no registered NCCL window for the dispatch {what} output"
+                    )
+                # The TRT-LLM pool owns the already-registered raw ncclWindow_t; holding win_buf keeps it.
+                return win_buf, SimpleNamespace(handle=handle)
+
+            self.output_tokens_buf, output_tokens_window = _acquire_window(self.output_tokens_buf, "token")
+            if self.scales_buf is not None:
+                self.scales_buf, scales_window = _acquire_window(self.scales_buf, "scales")
+            logger.info(
+                "NCCL EP persistent zero-copy outputs: token buffer "
+                f"{tuple(self.output_tokens_buf.shape)} {self.output_tokens_buf.dtype}"
+                + (
+                    f", scales buffer {tuple(self.scales_buf.shape)} {self.scales_buf.dtype}"
+                    if self.scales_buf is not None
+                    else ""
+                )
+            )
+
         # Wrap each persistent buffer as a Tensor descriptor. Torch owns the
         # storage; the descriptor only carries shape + a pointer (+ window
         # handle on dispatch output when zerocopy is on, so libnccl_ep's
         # opportunistic LL zero-copy path can fire).
-        self.output_tokens_nd = Tensor(self.output_tokens_buf)
+        self.output_tokens_nd = (
+            Tensor(self.output_tokens_buf, window=output_tokens_window, window_offset=0)
+            if output_tokens_window is not None
+            else Tensor(self.output_tokens_buf)
+        )
         self.recv_topk_idx_nd = Tensor(self.recv_topk_idx_buf)
         self.recv_topk_weights_nd = Tensor(self.recv_topk_weights_buf)
         self.recv_rank_counter_nd = Tensor(self.recv_rank_counter_buf)
-        self.scales_nd: Optional[Tensor] = (
-            Tensor(self.scales_buf) if self.scales_buf is not None else None
-        )
+        if self.scales_buf is None:
+            self.scales_nd: Optional[Tensor] = None
+        elif scales_window is not None:
+            self.scales_nd = Tensor(self.scales_buf, window=scales_window, window_offset=0)
+        else:
+            self.scales_nd = Tensor(self.scales_buf)
 
         # These describe context-owned, fixed-address receive buffers and
         # immutable dispatch policy. Constructing them once keeps the eager

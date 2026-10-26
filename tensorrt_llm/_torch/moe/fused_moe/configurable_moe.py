@@ -546,25 +546,25 @@ class ConfigurableMoE(MoE):
 
         """
 
-        # Early return if nothing to validate:
-        # - None: Atten is TP or single rank, no communication needed
-        # - AllGather: Already using fallback strategy, no validation needed
-        if self.comm is None or isinstance(self.comm, AllGatherReduceScatter):
+        # The fallback is per call, not sticky. The primary all-to-all strategy stays alive
+        # (comm destroyed/replaced only at destroy()), and AllGatherReduceScatter serves infeasible calls only.
+        if getattr(self, "_primary_comm", None) is None:
+            # Early return if nothing to validate (None: TP attention / single rank; AllGather: already the fallback).
+            if self.comm is None or isinstance(self.comm, AllGatherReduceScatter):
+                return
+            self._primary_comm = self.comm
+        primary = self._primary_comm
+        if primary.is_workload_feasible(all_rank_num_tokens, num_chunks):
+            self.comm = primary
             return
-
-        # Check if current strategy can be used
-        feasible_workload = self.comm.is_workload_feasible(all_rank_num_tokens, num_chunks)
-
-        if not feasible_workload:
-            all_rank_max_num_tokens = max(all_rank_num_tokens)
+        if getattr(self, "_fallback_comm", None) is None:
+            self._fallback_comm = AllGatherReduceScatter(mapping=self.mapping)
             logger.info(
-                f"Communication strategy {self.comm.__class__.__name__} "
-                f"cannot be used (num_chunks={num_chunks}, max_num_tokens={all_rank_max_num_tokens}). "
-                f"Falling back to AllGatherReduceScatter."
+                f"Communication strategy {primary.__class__.__name__} cannot be used for some calls "
+                f"(num_chunks={num_chunks}, max_num_tokens={max(all_rank_num_tokens)}); "
+                f"those calls use AllGatherReduceScatter (non-sticky fallback)."
             )
-
-            self.comm.destroy()
-            self.comm = AllGatherReduceScatter(mapping=self.mapping)
+        self.comm = self._fallback_comm
 
     def destroy(self):
         """Release communication resources.
@@ -578,7 +578,10 @@ class ConfigurableMoE(MoE):
         Prefer using ConfigurableMoE as a context manager (``with``) so
         that destroy() is called automatically on scope exit.
         """
-        if self.comm is not None:
+        primary = getattr(self, "_primary_comm", None)
+        if primary is not None:
+            primary.destroy()
+        elif self.comm is not None:
             self.comm.destroy()
 
     def __enter__(self):
